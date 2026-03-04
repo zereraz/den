@@ -1,26 +1,27 @@
 [server]
 host = "0.0.0.0"
 port = 8080
-# api_key = "secret-token"
+# api_key = "secret-token"  # optional, enables bearer token auth
 
 [docker]
-# socket = "/var/run/docker.sock"
-# network = "den-net"
+# socket = "/var/run/docker.sock"  # default: auto-detect
+# network = "den-net"              # default: bridge
 
 [pool]
-replenish_interval_secs = 5
+replenish_interval_secs = 5  # how often to top up warm pool
 
 [reaper]
-interval_secs = 10
-idle_timeout_secs = 300
+interval_secs = 10         # how often reaper checks for expired sandboxes
+idle_timeout_secs = 300    # stop container after 5min of no exec activity
+# volume_ttl_secs = 86400 # destroy volume 24h after sandbox stops (default)
 
 [tiers.default]
 image = "den-sandbox:latest"
 memory_mb = 1024
 cpus = 1.0
 pids = 256
-timeout_secs = 86400
-pool_size = 2
+timeout_secs = 86400       # max sandbox lifetime (24h)
+pool_size = 2              # warm containers ready to claim
 readonly_rootfs = false
 
 [tiers.default.tmpfs]
