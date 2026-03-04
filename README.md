@@ -108,3 +108,11 @@ Runs as non-root `sandbox` user (uid 1000) with passwordless sudo. Working direc
 Containers are pre-created in a warm pool (stopped). When you create a sandbox, den claims one from the pool and starts it instantly. Each container gets a named volume at `/home/sandbox` that survives container restarts — release a sandbox, resume it later, and all files are still there.
 
 A background reaper stops idle containers (default 5min) and cleans up volumes past their TTL (default 24h).
+
+## Security
+
+- File access restricted to `/home/sandbox` (path traversal blocked)
+- Reverse proxy limited to Docker bridge IPs (SSRF protection)
+- Exec timeout capped at 300s
+- Request body limit 100MB
+- Container resource limits (memory, CPU, PIDs) per tier
