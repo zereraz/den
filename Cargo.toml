@@ -1,0 +1,51 @@
+[package]
+name = "den"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight container runtime for AI agent sandboxes"
+
+[dependencies]
+# Docker API
+bollard = "0.19"
+
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+# HTTP client (for proxy)
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+
+# Concurrent state
+dashmap = "6"
+
+# Config + serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# IDs + time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tar archive handling (for Docker file transfer)
+tar = "0.4"
+bytes = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
