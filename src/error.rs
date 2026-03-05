@@ -9,6 +9,9 @@ pub enum DenError {
     #[error("docker: {0}")]
     Docker(#[from] bollard::errors::Error),
 
+    #[error("file not found: {path}")]
+    FileNotFound { path: String },
+
     #[error("sandbox {id} not found")]
     SandboxNotFound { id: String },
 
@@ -44,6 +47,7 @@ pub enum DenError {
 impl IntoResponse for DenError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
+            DenError::FileNotFound { .. } => (StatusCode::NOT_FOUND, self.to_string()),
             DenError::SandboxNotFound { .. } => (StatusCode::NOT_FOUND, self.to_string()),
             DenError::TierNotFound { .. } => (StatusCode::NOT_FOUND, self.to_string()),
             DenError::PoolExhausted { .. } => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),

@@ -284,7 +284,12 @@ impl DockerManager {
         let mut stream = self.client.download_from_container(container_id, Some(options));
         let mut tar_bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(|e| match &e {
+                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {
+                    DenError::FileNotFound { path: file_path.to_string() }
+                }
+                _ => DenError::Docker(e),
+            })?;
             tar_bytes.extend_from_slice(&chunk);
         }
 
