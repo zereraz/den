@@ -71,7 +71,7 @@ impl Pool {
                 let vol = volume_name();
                 let handle = tokio::spawn(async move {
                     docker.create_volume(&vol).await?;
-                    let cid = docker.create_container(&tier, &name, &vol).await?;
+                    let cid = docker.create_container(&tier, &name, &vol, &[]).await?;
                     Ok((cid, vol))
                 });
                 handles.push((tier_name.clone(), handle));
@@ -99,11 +99,14 @@ impl Pool {
         Ok(())
     }
 
-    /// Claim a sandbox from the pool. Starts the container and returns a Running sandbox.
+    /// Claim a sandbox from the pool (spot) or create one on-demand (dedicated).
+    /// When `bind_mounts` is non-empty, the container is created on-demand with
+    /// the requested host bind mounts — the pre-warmed pool is bypassed.
     pub async fn claim(
         &self,
         tier_name: &str,
         metadata: HashMap<String, String>,
+        bind_mounts: Vec<String>,
     ) -> Result<Sandbox, DenError> {
         let tier_config = self
             .config
@@ -120,31 +123,46 @@ impl Pool {
             });
         }
 
-        let tier_pool = self
-            .tiers
-            .get(tier_name)
-            .ok_or_else(|| DenError::TierNotFound {
-                tier: tier_name.into(),
-            })?;
+        let (container_id, vol_name) = if bind_mounts.is_empty() {
+            // Spot mode: claim from pre-warmed pool
+            let tier_pool = self
+                .tiers
+                .get(tier_name)
+                .ok_or_else(|| DenError::TierNotFound {
+                    tier: tier_name.into(),
+                })?;
 
-        let entry = {
-            let mut available = tier_pool.available.lock().await;
-            available.pop().ok_or_else(|| DenError::PoolExhausted {
-                tier: tier_name.into(),
-            })?
+            let entry = {
+                let mut available = tier_pool.available.lock().await;
+                available.pop().ok_or_else(|| DenError::PoolExhausted {
+                    tier: tier_name.into(),
+                })?
+            };
+
+            self.docker.start_container(&entry.container_id).await?;
+            (entry.container_id, entry.volume_name)
+        } else {
+            // Dedicated mode: create volume + container on-demand with bind mounts
+            let vol = volume_name();
+            let name = container_name(tier_name);
+            self.docker.create_volume(&vol).await?;
+            let cid = self
+                .docker
+                .create_container(tier_config, &name, &vol, &bind_mounts)
+                .await?;
+            self.docker.start_container(&cid).await?;
+            (cid, vol)
         };
-
-        // Start the pre-created container
-        self.docker.start_container(&entry.container_id).await?;
 
         let sid = sandbox_id(tier_name);
         let mut sandbox = Sandbox::new(
             sid.clone(),
-            entry.container_id,
-            entry.volume_name,
+            container_id,
+            vol_name,
             tier_name.into(),
             tier_config.timeout_secs,
             metadata,
+            bind_mounts,
         );
 
         sandbox.transition(SandboxState::Starting)?;
@@ -157,6 +175,7 @@ impl Pool {
             container = %sandbox.container_id,
             volume = %sandbox.volume_name,
             tier = %tier_name,
+            dedicated = %!sandbox.bind_mounts.is_empty(),
             "sandbox claimed"
         );
 
@@ -212,6 +231,7 @@ impl Pool {
 
         let volume_name = sandbox.volume_name.clone();
         let tier_name = sandbox.tier.clone();
+        let bind_mounts = sandbox.bind_mounts.clone();
 
         let tier_config = self
             .config
@@ -231,7 +251,7 @@ impl Pool {
         let name = container_name(&tier_name);
         let container_id = self
             .docker
-            .create_container(tier_config, &name, &volume_name)
+            .create_container(tier_config, &name, &volume_name, &bind_mounts)
             .await?;
         self.docker.start_container(&container_id).await?;
 
@@ -308,7 +328,7 @@ impl Pool {
                 let vol = volume_name();
                 handles.push(tokio::spawn(async move {
                     docker.create_volume(&vol).await?;
-                    let cid = docker.create_container(&tier, &name, &vol).await?;
+                    let cid = docker.create_container(&tier, &name, &vol, &[]).await?;
                     Ok::<_, DenError>((cid, vol))
                 }));
             }

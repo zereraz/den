@@ -37,7 +37,17 @@ RUN git config --global user.name "sandbox" && \
     git config --global user.email "sandbox@den.local" && \
     git config --global init.defaultBranch main
 
+# PDF/document tools (no sudo needed at runtime)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils qpdf file \
+    && rm -rf /var/lib/apt/lists/*
+
 USER sandbox
 WORKDIR /home/sandbox
+
+# Pre-installed Python venv with common packages
+RUN uv venv /home/sandbox/.venv && \
+    VIRTUAL_ENV=/home/sandbox/.venv uv pip install pypdf requests httpx beautifulsoup4 lxml && \
+    echo 'source /home/sandbox/.venv/bin/activate' >> /home/sandbox/.bashrc
 
 CMD ["sleep", "infinity"]

@@ -32,6 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sandboxes/{id}/volume", delete(destroy_sandbox))
         .route("/api/v1/sandboxes/{id}/exec", post(exec_rest))
         .route("/api/v1/sandboxes/{id}/exec/ws", get(exec_ws))
+        .route("/api/v1/sandboxes/{id}/diagnostics", get(diagnostics))
         .route("/api/v1/sandboxes/{id}/files/{*path}", get(download_file))
         .route("/api/v1/sandboxes/{id}/files/{*path}", put(upload_file))
         .route(
@@ -51,6 +52,11 @@ struct CreateRequest {
     tier: String,
     #[serde(default)]
     metadata: HashMap<String, String>,
+    /// Host bind mounts (e.g. ["/host/path:/container/path:rw"]).
+    /// When present, the sandbox is created on-demand (dedicated mode) instead
+    /// of being claimed from the pre-warmed pool.
+    #[serde(default)]
+    bind_mounts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +65,8 @@ struct SandboxResponse {
     container_id: String,
     tier: String,
     state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bind_mounts: Vec<String>,
 }
 
 impl From<Sandbox> for SandboxResponse {
@@ -68,6 +76,7 @@ impl From<Sandbox> for SandboxResponse {
             container_id: s.container_id,
             tier: s.tier,
             state: format!("{:?}", s.state).to_lowercase(),
+            bind_mounts: s.bind_mounts,
         }
     }
 }
@@ -85,6 +94,7 @@ struct ExecResponse {
     stdout: String,
     stderr: String,
     exit_code: i64,
+    oom_killed: bool,
 }
 
 // --- WS message types ---
@@ -108,15 +118,67 @@ struct WsServerMsg {
     #[serde(rename = "type")]
     msg_type: String,
     data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oom_killed: Option<bool>,
 }
 
 // --- Handlers ---
+
+/// Blocked host paths for bind mounts.
+const BLOCKED_BIND_PREFIXES: &[&str] = &[
+    "/var/run/docker",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/etc",
+    "/root",
+];
+
+/// Validate a bind mount string. Must be "host:container" or "host:container:mode".
+/// Host and container paths must be absolute. Host path must not target blocked prefixes.
+fn validate_bind_mount(mount: &str) -> Result<(), DenError> {
+    let parts: Vec<&str> = mount.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return Err(DenError::Other(anyhow::anyhow!(
+            "invalid bind mount format (expected host:container[:mode]): {mount}"
+        )));
+    }
+    let host_path = parts[0];
+    let container_path = parts[1];
+
+    if !host_path.starts_with('/') || !container_path.starts_with('/') {
+        return Err(DenError::Other(anyhow::anyhow!(
+            "bind mount paths must be absolute: {mount}"
+        )));
+    }
+    if container_path == "/home/sandbox" {
+        return Err(DenError::Other(anyhow::anyhow!(
+            "bind mount cannot target /home/sandbox (reserved for volume): {mount}"
+        )));
+    }
+    for prefix in BLOCKED_BIND_PREFIXES {
+        if host_path.starts_with(prefix) {
+            return Err(DenError::Other(anyhow::anyhow!(
+                "bind mount host path blocked ({prefix}): {mount}"
+            )));
+        }
+    }
+    if parts.len() == 3 && !matches!(parts[2], "ro" | "rw") {
+        return Err(DenError::Other(anyhow::anyhow!(
+            "bind mount mode must be 'ro' or 'rw': {mount}"
+        )));
+    }
+    Ok(())
+}
 
 async fn create_sandbox(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRequest>,
 ) -> Result<Json<SandboxResponse>, DenError> {
-    let sandbox = state.pool.claim(&req.tier, req.metadata).await?;
+    for mount in &req.bind_mounts {
+        validate_bind_mount(mount)?;
+    }
+    let sandbox = state.pool.claim(&req.tier, req.metadata, req.bind_mounts).await?;
     Ok(Json(sandbox.into()))
 }
 
@@ -204,10 +266,18 @@ async fn exec_rest(
     .map_err(|_| DenError::Timeout { seconds: timeout })?
     .map_err(DenError::from)?;
 
+    // Check OOM on signal-killed processes (137 = SIGKILL, typical OOM)
+    let oom_killed = if result.exit_code == 137 {
+        state.docker.container_oom_killed(&container_id).await.unwrap_or(false)
+    } else {
+        false
+    };
+
     Ok(Json(ExecResponse {
         stdout: result.stdout,
         stderr: result.stderr,
         exit_code: result.exit_code,
+        oom_killed,
     }))
 }
 
@@ -252,6 +322,7 @@ async fn handle_ws(
                         serde_json::to_string(&WsServerMsg {
                             msg_type: "error".into(),
                             data: format!("invalid start message: {e}"),
+                            oom_killed: None,
                         })
                         .unwrap()
                         .into(),
@@ -275,6 +346,7 @@ async fn handle_ws(
                     serde_json::to_string(&WsServerMsg {
                         msg_type: "error".into(),
                         data: e.to_string(),
+                        oom_killed: None,
                     })
                     .unwrap()
                     .into(),
@@ -292,6 +364,7 @@ async fn handle_ws(
 
     // Forward container output → WebSocket
     let docker_clone = state.docker.clone();
+    let cid = container_id.clone();
     let output_task = tokio::spawn(async move {
         use bollard::container::LogOutput;
 
@@ -311,6 +384,7 @@ async fn handle_ws(
             let json = serde_json::to_string(&WsServerMsg {
                 msg_type: msg_type.into(),
                 data,
+                oom_killed: None,
             })
             .unwrap();
 
@@ -319,17 +393,24 @@ async fn handle_ws(
             }
         }
 
-        // Send exit code
+        // Send exit code with OOM detection
         let exit_code = docker_clone
             .inspect_exec(&exec_id)
             .await
             .unwrap_or(-1);
+
+        let oom = if exit_code == 137 {
+            docker_clone.container_oom_killed(&cid).await.unwrap_or(false)
+        } else {
+            false
+        };
 
         let _ = ws_tx
             .send(Message::Text(
                 serde_json::to_string(&WsServerMsg {
                     msg_type: "exit".into(),
                     data: exit_code.to_string(),
+                    oom_killed: if oom { Some(true) } else { None },
                 })
                 .unwrap()
                 .into(),
@@ -370,6 +451,23 @@ async fn handle_ws(
         async { tokio::join!(output_task, input_task) },
     )
     .await;
+}
+
+async fn diagnostics(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::docker::ContainerDiagnostics>, DenError> {
+    let container_id = {
+        let entry = state
+            .pool
+            .sandboxes
+            .get(&id)
+            .ok_or_else(|| DenError::SandboxNotFound { id: id.clone() })?;
+        entry.value().container_id.clone()
+    };
+
+    let diag = state.docker.container_stats(&container_id).await?;
+    Ok(Json(diag))
 }
 
 /// Validate file path stays within /home/sandbox. Returns the sanitized absolute path.
@@ -574,6 +672,63 @@ mod tests {
             sanitize_file_path("a/b/c/d/e/f.txt").unwrap(),
             "/home/sandbox/a/b/c/d/e/f.txt"
         );
+    }
+
+    // --- validate_bind_mount ---
+
+    #[test]
+    fn bind_valid_rw() {
+        assert!(validate_bind_mount("/host/project:/workspace:rw").is_ok());
+    }
+
+    #[test]
+    fn bind_valid_no_mode() {
+        assert!(validate_bind_mount("/host/project:/workspace").is_ok());
+    }
+
+    #[test]
+    fn bind_valid_ro() {
+        assert!(validate_bind_mount("/data/models:/models:ro").is_ok());
+    }
+
+    #[test]
+    fn bind_rejects_relative_host() {
+        assert!(validate_bind_mount("relative/path:/workspace").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_relative_container() {
+        assert!(validate_bind_mount("/host:relative").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_docker_socket() {
+        assert!(validate_bind_mount("/var/run/docker.sock:/docker.sock").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_proc() {
+        assert!(validate_bind_mount("/proc:/proc:ro").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_etc() {
+        assert!(validate_bind_mount("/etc/passwd:/etc/passwd:ro").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_home_sandbox_target() {
+        assert!(validate_bind_mount("/host:/home/sandbox").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_bad_mode() {
+        assert!(validate_bind_mount("/host:/container:exec").is_err());
+    }
+
+    #[test]
+    fn bind_rejects_no_colon() {
+        assert!(validate_bind_mount("/just/a/path").is_err());
     }
 
     // --- guess_mime ---

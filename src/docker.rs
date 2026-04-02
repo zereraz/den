@@ -79,8 +79,10 @@ impl DockerManager {
         tier: &TierConfig,
         name: &str,
         volume_name: &str,
+        extra_binds: &[String],
     ) -> Result<String, DenError> {
-        let volume_bind = format!("{volume_name}:/home/sandbox");
+        let mut binds = vec![format!("{volume_name}:/home/sandbox")];
+        binds.extend(extra_binds.iter().cloned());
 
         let host_config = HostConfig {
             memory: Some((tier.memory_mb * 1024 * 1024) as i64),
@@ -92,7 +94,7 @@ impl DockerManager {
             readonly_rootfs: Some(tier.readonly_rootfs),
             tmpfs: tier.tmpfs.clone(),
             network_mode: self.network.clone(),
-            binds: Some(vec![volume_bind]),
+            binds: Some(binds),
             ..Default::default()
         };
 
@@ -358,4 +360,94 @@ impl DockerManager {
             .await?;
         Ok(inspect.state.and_then(|s| s.running).unwrap_or(false))
     }
+
+    /// Check if container was OOM-killed by Docker. Used after exit_code 137.
+    pub async fn container_oom_killed(&self, container_id: &str) -> Result<bool, DenError> {
+        let inspect = self
+            .client
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+        Ok(inspect
+            .state
+            .and_then(|s| s.oom_killed)
+            .unwrap_or(false))
+    }
+
+    /// Get single-shot container resource stats for diagnostics.
+    pub async fn container_stats(&self, container_id: &str) -> Result<ContainerDiagnostics, DenError> {
+        use bollard::query_parameters::StatsOptions;
+        use futures_util::TryStreamExt;
+
+        let options = StatsOptions {
+            stream: false,
+            one_shot: true,
+            ..Default::default()
+        };
+
+        let stats: Vec<_> = self
+            .client
+            .stats(container_id, Some(options))
+            .try_collect()
+            .await?;
+
+        let stat = stats
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no stats returned for container {container_id}"))?;
+
+        let memory_usage = stat.memory_stats.as_ref().and_then(|m| m.usage).unwrap_or(0);
+        let memory_limit = stat.memory_stats.as_ref().and_then(|m| m.limit).unwrap_or(0);
+        let memory_percent = if memory_limit > 0 {
+            (memory_usage as f64 / memory_limit as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let pids_current = stat.pids_stats.as_ref().and_then(|p| p.current).unwrap_or(0);
+        let pids_limit = stat.pids_stats.as_ref().and_then(|p| p.limit).unwrap_or(0);
+
+        // CPU percent: delta usage / delta system * num_cpus * 100
+        let cpu_percent = stat.cpu_stats.as_ref().map(|cpu| {
+            let cpu_usage = cpu.cpu_usage.as_ref()
+                .and_then(|u| u.total_usage)
+                .unwrap_or(0) as f64;
+            let precpu_usage = stat.precpu_stats.as_ref()
+                .and_then(|p| p.cpu_usage.as_ref())
+                .and_then(|u| u.total_usage)
+                .unwrap_or(0) as f64;
+            let cpu_delta = cpu_usage - precpu_usage;
+            let system_delta = cpu.system_cpu_usage.unwrap_or(0) as f64
+                - stat.precpu_stats.as_ref()
+                    .and_then(|p| p.system_cpu_usage)
+                    .unwrap_or(0) as f64;
+            let num_cpus = cpu.online_cpus.unwrap_or(1) as f64;
+            if system_delta > 0.0 {
+                (cpu_delta / system_delta) * num_cpus * 100.0
+            } else {
+                0.0
+            }
+        }).unwrap_or(0.0);
+
+        Ok(ContainerDiagnostics {
+            memory_usage_bytes: memory_usage,
+            memory_limit_bytes: memory_limit,
+            memory_percent: (memory_percent * 10.0).round() / 10.0, // 1 decimal
+            pids_current,
+            pids_limit,
+            cpu_percent: (cpu_percent * 10.0).round() / 10.0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContainerDiagnostics {
+    pub memory_usage_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub memory_percent: f64,
+    pub pids_current: u64,
+    pub pids_limit: u64,
+    pub cpu_percent: f64,
 }

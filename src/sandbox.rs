@@ -45,6 +45,10 @@ pub struct Sandbox {
     pub timeout_secs: u64,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+    /// Host bind mounts for dedicated sandboxes (e.g. "/host/path:/container/path:rw").
+    /// Stored so resume can recreate the container with the same mounts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bind_mounts: Vec<String>,
 }
 
 impl Sandbox {
@@ -55,6 +59,7 @@ impl Sandbox {
         tier: String,
         timeout_secs: u64,
         metadata: HashMap<String, String>,
+        bind_mounts: Vec<String>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -68,6 +73,7 @@ impl Sandbox {
             last_activity: now,
             timeout_secs,
             metadata,
+            bind_mounts,
         }
     }
 
@@ -120,6 +126,7 @@ mod tests {
             "standard".into(),
             60,
             HashMap::new(),
+            Vec::new(),
         )
     }
 
