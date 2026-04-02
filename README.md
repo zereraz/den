@@ -15,14 +15,15 @@ cargo run -- --config den.toml
 ## API
 
 ```
-POST   /api/v1/sandboxes                    → create sandbox
+POST   /api/v1/sandboxes                    → create sandbox (spot or dedicated with bind_mounts)
 GET    /api/v1/sandboxes                    → list all
 GET    /api/v1/sandboxes/{id}               → get one
 DELETE /api/v1/sandboxes/{id}               → release (keep volume)
-POST   /api/v1/sandboxes/{id}/resume        → resume (new container, same volume)
+POST   /api/v1/sandboxes/{id}/resume        → resume (new container, same volume + bind mounts)
 DELETE /api/v1/sandboxes/{id}/volume        → destroy (remove everything)
 POST   /api/v1/sandboxes/{id}/exec          → execute command
 GET    /api/v1/sandboxes/{id}/exec/ws       → streaming exec (WebSocket)
+GET    /api/v1/sandboxes/{id}/diagnostics   → container resource usage (memory, CPU, PIDs)
 GET    /api/v1/sandboxes/{id}/files/{*path}  → download file
 PUT    /api/v1/sandboxes/{id}/files/{*path}  → upload file
 GET    /proxy/{id}/{port}/{*rest}            → reverse proxy to container
@@ -33,8 +34,12 @@ GET    /api/v1/health                       → health check
 ## Usage
 
 ```bash
-# Create a sandbox
+# Create a sandbox (spot — claimed from pre-warmed pool)
 curl -X POST localhost:8080/api/v1/sandboxes -H 'Content-Type: application/json' -d '{"tier":"default"}'
+
+# Create a dedicated sandbox with host bind mounts (bypasses pool)
+curl -X POST localhost:8080/api/v1/sandboxes -H 'Content-Type: application/json' \
+  -d '{"tier":"default","bind_mounts":["/path/to/project:/workspace:rw"]}'
 
 # Execute a command
 curl -X POST localhost:8080/api/v1/sandboxes/$ID/exec -H 'Content-Type: application/json' -d '{"cmd":["echo","hello"]}'
@@ -45,10 +50,13 @@ curl -X PUT localhost:8080/api/v1/sandboxes/$ID/files/script.py -d 'print("hello
 # Download a file
 curl localhost:8080/api/v1/sandboxes/$ID/files/script.py
 
+# Container diagnostics (memory, CPU, PIDs)
+curl localhost:8080/api/v1/sandboxes/$ID/diagnostics
+
 # Release (stops container, keeps volume for resume)
 curl -X DELETE localhost:8080/api/v1/sandboxes/$ID
 
-# Resume (new container, same volume — files persist)
+# Resume (new container, same volume + same bind mounts)
 curl -X POST localhost:8080/api/v1/sandboxes/$ID/resume
 
 # Destroy (removes everything)
@@ -105,7 +113,28 @@ Runs as non-root `sandbox` user (uid 1000) with passwordless sudo. Working direc
 
 ## How It Works
 
+### Spot mode (default)
+
 Containers are pre-created in a warm pool (stopped). When you create a sandbox, den claims one from the pool and starts it instantly. Each container gets a named volume at `/home/sandbox` that survives container restarts — release a sandbox, resume it later, and all files are still there.
+
+### Dedicated mode (bind mounts)
+
+Pass `bind_mounts` when creating a sandbox to mount host directories into the container. Dedicated sandboxes bypass the pre-warmed pool — the container is created on-demand with the requested mounts.
+
+```bash
+curl -X POST localhost:8080/api/v1/sandboxes -H 'Content-Type: application/json' \
+  -d '{"tier":"default","bind_mounts":["/home/user/project:/workspace:rw"]}'
+```
+
+Bind mounts give zero-copy filesystem access — the container reads and writes directly to the host. The volume at `/home/sandbox` is still created for caches, tools, and shell state.
+
+Bind mounts are stored on the sandbox, so **resume recreates the container with the same mounts**. Files added to the host directory while the sandbox was stopped are visible immediately after resume.
+
+Format: `host_path:container_path[:mode]` where mode is `ro` or `rw` (default: Docker's default, typically `rw`).
+
+Blocked host paths: `/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/var/run/docker*`. Container path `/home/sandbox` is reserved for the volume.
+
+### Reaper
 
 A background reaper stops idle containers (default 5min) and cleans up volumes past their TTL (default 24h).
 
