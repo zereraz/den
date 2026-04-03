@@ -81,7 +81,7 @@ Stops and removes the container but **keeps the volume** and sandbox record. The
 
 `POST /api/v1/sandboxes/{id}/resume`
 
-Creates a new container mounting the existing volume. If the sandbox had bind mounts, they are reattached. Works from `completed`, `failed`, `timeout`, or `defunct` states.
+Creates a new container mounting the existing volume. If the sandbox had bind mounts, they are reattached. Works from `completed`, `timeout`, or `defunct` states.
 
 **Response:** `200` — sandbox object with new `container_id`, state `running`.
 
@@ -143,7 +143,7 @@ Runs a command and returns all output when done.
 | 404 | Sandbox not found |
 | 409 | Sandbox not in running state |
 | 429 | Exec concurrency limit reached |
-| 503 | Sandbox is defunct (container died) |
+| 503 | Sandbox is defunct (container died) or insufficient resources |
 | 504 | Exec timed out |
 
 ---
@@ -179,7 +179,7 @@ Bidirectional streaming exec. Holds an exec permit for the session lifetime.
 **Limits:**
 
 - Max message size: 64 KB
-- Max session duration: 1 hour
+- Max session duration: 1 hour (connection closed silently on timeout)
 - Holds exec permit — counts toward `max_concurrent_execs`
 
 ---
@@ -272,3 +272,5 @@ System-level resource info from Docker.
   "containers_total": 5
 }
 ```
+
+**Note:** `used_memory_bytes` is always `0` — Docker's info API does not expose this. For per-container memory usage, use the [diagnostics endpoint](#container-diagnostics).

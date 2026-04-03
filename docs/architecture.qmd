@@ -38,15 +38,15 @@ Running ◀──────── resume (new container, same volume + mounts)
 
 | State | Description | Resumable | Exec-able | Volume |
 |-------|-------------|-----------|-----------|--------|
-| `pending` | Just created | — | no | exists |
-| `starting` | Container starting | — | no | exists |
-| `running` | Ready for exec | — | yes | exists |
+| `pending` | Just created | transient | no | exists |
+| `starting` | Container starting | transient | no | exists |
+| `running` | Ready for exec | active | yes | exists |
 | `defunct` | Container died (OOM, crash) | yes | no | exists |
 | `completed` | Released by client | yes | no | exists |
-| `failed` | Setup/creation failed | — | no | exists |
+| `failed` | Setup/creation failed | no | no | exists |
 | `timeout` | Idle/lifetime expired | yes | no | exists |
 
-Terminal states (`completed`, `failed`, `timeout`) have volumes cleaned up by the reaper after `volume_ttl_secs`. Defunct sandboxes are also cleaned up after the TTL if not resumed.
+Terminal states (`completed`, `failed`, `timeout`) have volumes cleaned up by the reaper after `volume_ttl_secs`. Defunct sandboxes are also cleaned up after the TTL if not resumed. Resume from `defunct` works by directly resetting state to `pending` (bypasses normal state transitions).
 
 ## Spot vs Dedicated
 
@@ -79,7 +79,7 @@ All tasks observe a shared `watch::channel` for coordinated shutdown.
 ## Security Layers
 
 - **File API:** path traversal prevention — all paths resolved against `/home/sandbox`
-- **Bind mounts:** blocked prefixes (`/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/var/run/docker*`), blocked target (`/home/sandbox`)
+- **Bind mounts:** blocked host prefixes (`/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/var/run/docker*`), blocked container target (`/home/sandbox` — reserved for volume)
 - **Proxy:** SSRF protection — only Docker bridge IPs allowed (172.16-31.x.x, 192.168.x.x)
 - **Exec:** 300s max timeout, 100MB body limit
 - **Containers:** `cap_drop: ALL`, `no-new-privileges`, configurable memory/CPU/PID limits
