@@ -93,6 +93,7 @@ pids = 256                 # max processes
 timeout_secs = 86400       # max sandbox lifetime
 pool_size = 2              # warm containers ready to claim
 readonly_rootfs = false
+max_concurrent_execs = 4   # max parallel exec per sandbox (429 when exceeded)
 
 [tiers.default.tmpfs]
 "/tmp" = "size=200M,mode=1777"
@@ -134,9 +135,29 @@ Format: `host_path:container_path[:mode]` where mode is `ro` or `rw` (default: D
 
 Blocked host paths: `/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/var/run/docker*`. Container path `/home/sandbox` is reserved for the volume.
 
+### Defunct detection
+
+If a container dies unexpectedly (OOM, crash), the reaper marks the sandbox as `defunct`. Exec requests return `503` with a clear message:
+
+```json
+{"error": "sandbox <id> is defunct (container died), resume to recover"}
+```
+
+Resume a defunct sandbox to get a fresh container with the same volume and bind mounts. Defunct sandboxes are not terminal — they stay resumable until volume TTL expires.
+
+### Exec backpressure
+
+Each sandbox has a concurrent exec limit (`max_concurrent_execs`, default 4 per tier). When all slots are in use, additional exec requests get `429 Too Many Requests`:
+
+```json
+{"error": "sandbox <id> exec limit reached (4 concurrent)"}
+```
+
+WebSocket exec sessions hold a permit for their entire lifetime. Permits are released automatically when the exec completes or the connection drops.
+
 ### Reaper
 
-A background reaper stops idle containers (default 5min) and cleans up volumes past their TTL (default 24h).
+A background reaper stops idle containers (default 5min) and cleans up volumes past their TTL (default 24h). Crashed containers are transitioned to `defunct` rather than `failed`, keeping them resumable.
 
 ## Security
 
