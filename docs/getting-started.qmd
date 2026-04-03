@@ -1,0 +1,79 @@
+---
+title: "Getting Started"
+---
+
+## Prerequisites
+
+- [Docker Desktop](https://www.docker.com/) or [OrbStack](https://orbstack.dev/)
+- [Rust toolchain](https://rustup.rs/) (for building from source)
+
+## Build the Sandbox Image
+
+The sandbox image is what runs inside each container. It includes Python, Node.js, common CLI tools, and runs as a non-root user.
+
+```bash
+docker build -t den-sandbox:latest -f Dockerfile.sandbox .
+```
+
+The image includes:
+
+| Tool | Version |
+|------|---------|
+| Ubuntu | 24.04 |
+| Python | 3.12 + uv |
+| Node.js | 22 LTS + pnpm, yarn |
+| CLI tools | ripgrep, fd-find, jq, curl, wget |
+| Build tools | build-essential, cmake, git |
+| PDF tools | poppler-utils, qpdf, file |
+
+## Build and Run Den
+
+```bash
+# Build
+cargo build --release
+
+# Run with default config
+./target/release/den --config den.toml
+```
+
+Den will:
+
+1. Connect to the Docker daemon
+2. Clean up orphaned containers/volumes from previous runs
+3. Pre-warm the container pool (default: 2 containers per tier)
+4. Start listening on `0.0.0.0:8080`
+
+## Override the Port
+
+```bash
+./target/release/den --config den.toml --port 9090
+```
+
+## Verify It's Running
+
+```bash
+curl localhost:8080/api/v1/health
+# → ok
+```
+
+## Your First Sandbox
+
+```bash
+# Create
+ID=$(curl -sf -X POST localhost:8080/api/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"tier":"default"}' | jq -r .id)
+
+echo "Sandbox: $ID"
+
+# Run a command
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["python3","-c","print(\"hello from sandbox\")"]}' | jq .
+
+# Check resource usage
+curl -sf "localhost:8080/api/v1/sandboxes/$ID/diagnostics" | jq .
+
+# Clean up
+curl -sf -X DELETE "localhost:8080/api/v1/sandboxes/$ID/volume"
+```

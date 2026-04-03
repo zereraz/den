@@ -1,0 +1,191 @@
+---
+title: "Examples"
+---
+
+## Basic Lifecycle
+
+```bash
+# Create a sandbox
+ID=$(curl -sf -X POST localhost:8080/api/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"tier":"default"}' | jq -r .id)
+
+# Run a command
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["echo","hello"]}' | jq .stdout
+# → "hello\n"
+
+# Upload a file
+curl -sf -X PUT "localhost:8080/api/v1/sandboxes/$ID/files/hello.py" \
+  -d 'print("hello from python")'
+
+# Run it
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["python3","hello.py"]}' | jq .stdout
+# → "hello from python\n"
+
+# Download the file back
+curl -sf "localhost:8080/api/v1/sandboxes/$ID/files/hello.py"
+# → print("hello from python")
+
+# Release (stop container, keep volume)
+curl -sf -X DELETE "localhost:8080/api/v1/sandboxes/$ID"
+
+# Resume later (new container, same files)
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/resume" | jq .state
+# → "running"
+
+# Destroy when done
+curl -sf -X DELETE "localhost:8080/api/v1/sandboxes/$ID/volume"
+```
+
+## Bind Mounts (Dedicated Mode)
+
+Mount a host project directory for zero-copy access:
+
+```bash
+# Create with bind mount
+ID=$(curl -sf -X POST localhost:8080/api/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tier": "default",
+    "bind_mounts": ["/home/user/myproject:/workspace:rw"]
+  }' | jq -r .id)
+
+# Agent reads host files directly
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["ls","/workspace"]}' | jq .stdout
+
+# Agent writes — appears on host instantly
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["bash","-c","echo new-content > /workspace/output.txt"]}'
+
+# Verify on host
+cat /home/user/myproject/output.txt
+# → new-content
+
+# Release + resume preserves bind mounts
+curl -sf -X DELETE "localhost:8080/api/v1/sandboxes/$ID"
+
+# Add files on host while stopped
+echo "added while stopped" > /home/user/myproject/new.txt
+
+# Resume — new container, same mounts, sees new file
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/resume"
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["cat","/workspace/new.txt"]}' | jq .stdout
+# → "added while stopped\n"
+```
+
+## WebSocket Streaming Exec
+
+For long-running commands with real-time output:
+
+```python
+import json
+import websockets
+import asyncio
+
+async def stream_exec(sandbox_id, command):
+    url = f"ws://localhost:8080/api/v1/sandboxes/{sandbox_id}/exec/ws"
+    async with websockets.connect(url) as ws:
+        # Send command
+        await ws.send(json.dumps({
+            "cmd": ["bash", "-c", command]
+        }))
+
+        # Stream output
+        async for msg in ws:
+            data = json.loads(msg)
+            if data["type"] in ("stdout", "stderr"):
+                print(data["data"], end="")
+            elif data["type"] == "exit":
+                print(f"\nExit code: {data['data']}")
+                if data.get("oom_killed"):
+                    print("Process was OOM-killed!")
+                break
+
+asyncio.run(stream_exec("default-abc123", "for i in 1 2 3; do echo $i; sleep 1; done"))
+```
+
+## OOM Detection
+
+```bash
+# Run something memory-hungry
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["python3","-c","x = bytearray(2**30)"],"timeout_secs":30}' | jq .
+# → {"stdout": "", "stderr": "Killed\n", "exit_code": 137, "oom_killed": true}
+```
+
+Check proactively before running expensive commands:
+
+```bash
+curl -sf "localhost:8080/api/v1/sandboxes/$ID/diagnostics" | jq .
+# → {"memory_usage_bytes": 234881024, "memory_limit_bytes": 1073741824,
+#    "memory_percent": 21.8, "pids_current": 12, "pids_limit": 256, ...}
+```
+
+## Defunct Recovery
+
+When a container dies unexpectedly:
+
+```bash
+# Sandbox is running but container crashed (OOM, kernel kill)
+curl -sf "localhost:8080/api/v1/sandboxes/$ID" | jq .state
+# → "defunct"
+
+# Exec returns clear error
+curl -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["echo","hi"]}' 2>/dev/null
+# → {"error": "sandbox <id> is defunct (container died), resume to recover"}
+
+# Resume to get a fresh container
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/resume" | jq .state
+# → "running"
+
+# Back in business
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["echo","recovered"]}' | jq .stdout
+# → "recovered\n"
+```
+
+## Exec Backpressure
+
+With `max_concurrent_execs = 4`:
+
+```bash
+# Fire 5 concurrent execs
+for i in 1 2 3 4 5; do
+  curl -s -w "\n%{http_code}" -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+    -H 'Content-Type: application/json' \
+    -d '{"cmd":["sleep","5"]}' &
+done
+wait
+
+# Output: 4 return 200, 1 returns 429
+# → {"error": "sandbox <id> exec limit reached (4 concurrent)"}
+```
+
+## Reverse Proxy
+
+Access services running inside the container:
+
+```bash
+# Start a web server inside the sandbox
+curl -sf -X POST "localhost:8080/api/v1/sandboxes/$ID/exec" \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["bash","-c","python3 -m http.server 3000 &"]}'
+
+# Access it via den's proxy
+curl -sf "localhost:8080/proxy/$ID/3000/"
+```
+
+Only Docker bridge IPs are allowed (SSRF protection).

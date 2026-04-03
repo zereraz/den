@@ -1,0 +1,35 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "Den"
+  description: "Docker-based sandbox runtime for AI agents"
+  repo-url: https://github.com/zereraz/den
+  repo-actions: [issue]
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: getting-started.qmd
+        text: Getting Started
+      - href: api-reference.qmd
+        text: API Reference
+      - href: configuration.qmd
+        text: Configuration
+      - href: architecture.qmd
+        text: Architecture
+      - href: examples.qmd
+        text: Examples
+    right:
+      - icon: github
+        href: https://github.com/zereraz/den
+  page-footer:
+    center: "Den — sandbox runtime for AI agents"
+
+format:
+  html:
+    theme: [cosmo, custom.scss]
+    toc: true
+    code-copy: true
+    code-overflow: wrap

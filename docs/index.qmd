@@ -1,0 +1,65 @@
+---
+title: "Den"
+subtitle: "Docker-based sandbox runtime for AI agents"
+---
+
+Den gives AI agents isolated Docker containers to work in. Pre-warms a container pool for instant sandbox creation. REST + WebSocket API.
+
+## Key Features
+
+- **Instant sandboxes** — pre-warmed container pool, claim in milliseconds
+- **Two modes** — spot (pooled) for generic work, dedicated (bind mounts) for zero-copy host access
+- **Persistent volumes** — release a sandbox, resume later, files are still there
+- **Exec backpressure** — per-sandbox concurrency limits prevent resource exhaustion
+- **Defunct detection** — crashed containers are detected and clearly reported, resumable
+- **Security** — path traversal prevention, SSRF-safe proxy, resource limits per tier
+
+## Quick Start
+
+```bash
+# Build the sandbox image
+docker build -t den-sandbox:latest -f Dockerfile.sandbox .
+
+# Run den
+cargo run -- --config den.toml
+```
+
+```bash
+# Create a sandbox
+curl -X POST localhost:8080/api/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"tier":"default"}'
+
+# Execute a command
+curl -X POST localhost:8080/api/v1/sandboxes/$ID/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd":["echo","hello from sandbox"]}'
+```
+
+## How It Works
+
+```
+Orchestrator (nama, scripts, CI)
+  │
+  │  REST / WebSocket
+  ▼
+┌─────────────────────────────┐
+│         Den Server          │
+│   Axum + Tokio + Bollard    │
+│                             │
+│  Pool ──▶ Docker Containers │
+│  Reaper ──▶ Cleanup         │
+│  Scheduler ──▶ Resources    │
+└─────────────────────────────┘
+  │
+  │  Docker Socket
+  ▼
+┌─────────────────────────────┐
+│     Docker Containers       │
+│  Ubuntu 24.04 + tools       │
+│  /home/sandbox (volume)     │
+│  /workspace (bind mount)    │
+└─────────────────────────────┘
+```
+
+The agent runs **outside** the container. Containers are just "hands" — exec environments. Den manages the lifecycle, the orchestrator translates tool calls into Den API calls.

@@ -1,0 +1,274 @@
+---
+title: "API Reference"
+---
+
+All endpoints are under `/api/v1/` unless noted.
+
+## Sandbox Lifecycle
+
+### Create Sandbox
+
+`POST /api/v1/sandboxes`
+
+Creates a new sandbox. If `bind_mounts` is empty or omitted, claims from the pre-warmed pool (spot mode). Otherwise creates on-demand (dedicated mode).
+
+**Request:**
+
+```json
+{
+  "tier": "default",
+  "metadata": {"purpose": "testing"},
+  "bind_mounts": ["/host/project:/workspace:rw"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tier` | string | yes | Tier name from `den.toml` |
+| `metadata` | object | no | Arbitrary key-value pairs stored on the sandbox |
+| `bind_mounts` | string[] | no | Host bind mounts. Triggers dedicated mode when present |
+
+**Response:** `200`
+
+```json
+{
+  "id": "default-bf5e5080-b919-4d0f-823c-1b2ad5a35c55",
+  "container_id": "1bc8c5bd5939...",
+  "tier": "default",
+  "state": "running",
+  "bind_mounts": ["/host/project:/workspace:rw"]
+}
+```
+
+`bind_mounts` is omitted from the response when empty.
+
+**Errors:**
+
+| Code | Reason |
+|------|--------|
+| 404 | Tier not found |
+| 503 | Pool exhausted (spot mode) or insufficient resources |
+
+---
+
+### Get Sandbox
+
+`GET /api/v1/sandboxes/{id}`
+
+**Response:** `200` — same shape as create response.
+
+---
+
+### List Sandboxes
+
+`GET /api/v1/sandboxes`
+
+**Response:** `200` — array of sandbox objects.
+
+---
+
+### Release Sandbox
+
+`DELETE /api/v1/sandboxes/{id}`
+
+Stops and removes the container but **keeps the volume** and sandbox record. The sandbox can be resumed later.
+
+**Response:** `204 No Content`
+
+---
+
+### Resume Sandbox
+
+`POST /api/v1/sandboxes/{id}/resume`
+
+Creates a new container mounting the existing volume. If the sandbox had bind mounts, they are reattached. Works from `completed`, `failed`, `timeout`, or `defunct` states.
+
+**Response:** `200` — sandbox object with new `container_id`, state `running`.
+
+---
+
+### Destroy Sandbox
+
+`DELETE /api/v1/sandboxes/{id}/volume`
+
+Removes everything: container, volume, and sandbox record. No recovery after this.
+
+**Response:** `204 No Content`
+
+---
+
+## Command Execution
+
+### REST Exec
+
+`POST /api/v1/sandboxes/{id}/exec`
+
+Runs a command and returns all output when done.
+
+**Request:**
+
+```json
+{
+  "cmd": ["python3", "-c", "print('hello')"],
+  "workdir": "/workspace",
+  "env": ["FOO=bar"],
+  "timeout_secs": 30
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cmd` | string[] | yes | Command and arguments |
+| `workdir` | string | no | Working directory inside container |
+| `env` | string[] | no | Environment variables (`KEY=VALUE`) |
+| `timeout_secs` | number | no | Timeout in seconds (default: 30, max: 300) |
+
+**Response:** `200`
+
+```json
+{
+  "stdout": "hello\n",
+  "stderr": "",
+  "exit_code": 0,
+  "oom_killed": false
+}
+```
+
+`oom_killed` is `true` when the process was killed by Docker's OOM killer (exit code 137).
+
+**Errors:**
+
+| Code | Reason |
+|------|--------|
+| 404 | Sandbox not found |
+| 409 | Sandbox not in running state |
+| 429 | Exec concurrency limit reached |
+| 503 | Sandbox is defunct (container died) |
+| 504 | Exec timed out |
+
+---
+
+### WebSocket Exec
+
+`GET /api/v1/sandboxes/{id}/exec/ws`
+
+Bidirectional streaming exec. Holds an exec permit for the session lifetime.
+
+**Client sends first message (start command):**
+
+```json
+{"cmd": ["bash", "-c", "echo hello && sleep 2 && echo done"], "workdir": "/workspace"}
+```
+
+**Server sends messages:**
+
+```json
+{"type": "stdout", "data": "hello\n"}
+{"type": "stderr", "data": "warning: ...\n"}
+{"type": "exit", "data": "0"}
+{"type": "exit", "data": "137", "oom_killed": true}
+{"type": "error", "data": "exec failed: ..."}
+```
+
+**Client sends stdin:**
+
+```json
+{"type": "stdin", "data": "some input\n"}
+```
+
+**Limits:**
+
+- Max message size: 64 KB
+- Max session duration: 1 hour
+- Holds exec permit — counts toward `max_concurrent_execs`
+
+---
+
+## Files
+
+### Download File
+
+`GET /api/v1/sandboxes/{id}/files/{path}`
+
+Downloads a file from `/home/sandbox/{path}`. MIME type auto-detected.
+
+**Response:** `200` with file content.
+
+**Errors:** `404` if file not found. Path traversal outside `/home/sandbox` is blocked.
+
+---
+
+### Upload File
+
+`PUT /api/v1/sandboxes/{id}/files/{path}`
+
+Uploads content to `/home/sandbox/{path}`. Body is raw file content.
+
+**Response:** `204 No Content`
+
+**Limit:** 100 MB max body size.
+
+---
+
+## Diagnostics
+
+### Container Diagnostics
+
+`GET /api/v1/sandboxes/{id}/diagnostics`
+
+Single-shot resource usage snapshot from Docker stats.
+
+**Response:** `200`
+
+```json
+{
+  "memory_usage_bytes": 234881024,
+  "memory_limit_bytes": 1073741824,
+  "memory_percent": 21.8,
+  "pids_current": 12,
+  "pids_limit": 256,
+  "cpu_percent": 4.2
+}
+```
+
+---
+
+## Proxy
+
+### Reverse Proxy
+
+`ANY /proxy/{id}/{port}/{path}`
+
+Forwards HTTP requests to `container_ip:port/path`. Only Docker bridge IPs are allowed (SSRF protection).
+
+---
+
+## System
+
+### Health Check
+
+`GET /api/v1/health`
+
+Pings Docker daemon with 2s timeout.
+
+**Response:** `200` — `ok`
+
+---
+
+### Resource Snapshot
+
+`GET /api/v1/resources`
+
+System-level resource info from Docker.
+
+**Response:** `200`
+
+```json
+{
+  "total_memory_bytes": 8589934592,
+  "used_memory_bytes": 0,
+  "cpus": 8,
+  "containers_running": 3,
+  "containers_total": 5
+}
+```

@@ -1,0 +1,85 @@
+---
+title: "Architecture"
+---
+
+## Design Principles
+
+- **Agent runs outside** — containers are exec environments, not agent hosts
+- **Sleep infinity** — containers have no daemon, just `sleep infinity` as PID 1
+- **Pool for speed** — pre-warmed containers eliminate cold start
+- **Volumes for persistence** — survive container restarts, enable release/resume
+- **Bind mounts for zero-copy** — dedicated mode skips tar-based file transfer
+
+## Sandbox Lifecycle
+
+```
+POST /sandboxes
+  │
+  ├── bind_mounts empty? ──▶ Spot: claim from pool, start
+  │
+  └── bind_mounts present? ──▶ Dedicated: create volume + container, start
+  │
+  ▼
+Running ◀──────── resume (new container, same volume + mounts)
+  │       │
+  │       │
+  ├── exec ──▶ command runs via docker exec
+  │       │
+  ├── idle timeout ──▶ Timeout (terminal, volume kept for TTL)
+  │       │
+  ├── container crash ──▶ Defunct (resumable)
+  │       │
+  ├── DELETE /sandboxes/{id} ──▶ Completed (volume kept, resumable)
+  │
+  └── DELETE /sandboxes/{id}/volume ──▶ Destroyed (everything removed)
+```
+
+## State Machine
+
+| State | Description | Resumable | Exec-able | Volume |
+|-------|-------------|-----------|-----------|--------|
+| `pending` | Just created | — | no | exists |
+| `starting` | Container starting | — | no | exists |
+| `running` | Ready for exec | — | yes | exists |
+| `defunct` | Container died (OOM, crash) | yes | no | exists |
+| `completed` | Released by client | yes | no | exists |
+| `failed` | Setup/creation failed | — | no | exists |
+| `timeout` | Idle/lifetime expired | yes | no | exists |
+
+Terminal states (`completed`, `failed`, `timeout`) have volumes cleaned up by the reaper after `volume_ttl_secs`. Defunct sandboxes are also cleaned up after the TTL if not resumed.
+
+## Spot vs Dedicated
+
+| | Spot | Dedicated |
+|---|---|---|
+| **Source** | Pre-warmed pool | Created on-demand |
+| **Startup** | ~instant (container start only) | ~1-2s (create + start) |
+| **File I/O** | Tar API (`GET/PUT /files/`) | Bind mount (zero-copy) |
+| **Use case** | Generic exec tasks | Project-specific work, host file access |
+| **Pool** | Uses pool, replenished automatically | Bypasses pool |
+
+Both modes get a persistent volume at `/home/sandbox` for caches, tools, and state.
+
+## Exec Backpressure
+
+Each sandbox has a permit pool sized to `max_concurrent_execs` (default 4, configurable per tier). REST and WebSocket execs acquire a permit before running. When all permits are in use, additional requests get `429 Too Many Requests`.
+
+WebSocket sessions hold their permit for the entire connection lifetime. Permits are released automatically via RAII when the exec completes or the connection drops.
+
+## Background Tasks
+
+Den runs three background tasks:
+
+1. **Reaper** — sweeps every `interval_secs`, stops idle/expired/crashed containers, cleans up volumes past TTL
+2. **Replenisher** — tops up the warm pool every `replenish_interval_secs`
+3. **HTTP server** — Axum with graceful shutdown on Ctrl-C
+
+All tasks observe a shared `watch::channel` for coordinated shutdown.
+
+## Security Layers
+
+- **File API:** path traversal prevention — all paths resolved against `/home/sandbox`
+- **Bind mounts:** blocked prefixes (`/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/var/run/docker*`), blocked target (`/home/sandbox`)
+- **Proxy:** SSRF protection — only Docker bridge IPs allowed (172.16-31.x.x, 192.168.x.x)
+- **Exec:** 300s max timeout, 100MB body limit
+- **Containers:** `cap_drop: ALL`, `no-new-privileges`, configurable memory/CPU/PID limits

@@ -1,0 +1,126 @@
+---
+title: "Configuration"
+---
+
+All configuration is in `den.toml`.
+
+## Full Example
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8080
+# api_key = "secret-token"  # optional bearer token auth
+
+[docker]
+# socket = "/var/run/docker.sock"  # default: auto-detect
+# network = "den-net"              # default: bridge
+
+[pool]
+replenish_interval_secs = 5  # how often to top up warm pool
+
+[reaper]
+interval_secs = 10           # how often to check for expired sandboxes
+idle_timeout_secs = 300      # stop container after 5min idle
+# volume_ttl_secs = 86400   # destroy volume 24h after stop (default)
+
+[tiers.default]
+image = "den-sandbox:latest"
+memory_mb = 1024              # container memory limit
+cpus = 1.0                    # CPU quota
+pids = 256                    # max processes
+timeout_secs = 86400          # max sandbox lifetime (24h)
+pool_size = 2                 # warm containers ready to claim
+readonly_rootfs = false
+max_concurrent_execs = 4      # max parallel exec per sandbox (429 when exceeded)
+
+[tiers.default.tmpfs]
+"/tmp" = "size=200M,mode=1777"
+```
+
+## Server
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `host` | `0.0.0.0` | Bind address |
+| `port` | `8080` | Listen port (overridable via `--port` CLI flag) |
+| `api_key` | — | Optional bearer token for authentication |
+
+## Docker
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `socket` | auto-detect | Path to Docker socket |
+| `network` | bridge | Docker network for containers |
+
+## Pool
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `replenish_interval_secs` | `5` | How often the pool tops up to target size |
+
+## Reaper
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `interval_secs` | `10` | Sweep interval |
+| `idle_timeout_secs` | `300` | Stop idle containers after this many seconds |
+| `volume_ttl_secs` | `86400` | Destroy volumes this long after sandbox stops (24h) |
+
+The reaper runs in two phases:
+
+1. **Phase 1:** Stop running containers that are expired, idle, or crashed. Crashed containers are marked **defunct** (resumable), not failed.
+2. **Phase 2:** Destroy volumes for terminal and defunct sandboxes past the TTL.
+
+## Tiers
+
+Define multiple tiers with different resource limits. Request a tier by name when creating a sandbox.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `image` | — | Docker image (required) |
+| `memory_mb` | — | Memory limit in MB (required) |
+| `cpus` | — | CPU quota (required) |
+| `pids` | `256` | Max processes |
+| `timeout_secs` | — | Max sandbox lifetime in seconds (required) |
+| `pool_size` | `3` | Pre-warmed containers in pool |
+| `readonly_rootfs` | `false` | Mount root filesystem read-only |
+| `max_concurrent_execs` | `4` | Max parallel execs per sandbox |
+| `tmpfs` | — | Tmpfs mounts (path → options map) |
+
+### Example: Multiple Tiers
+
+```toml
+[tiers.light]
+image = "den-sandbox:latest"
+memory_mb = 512
+cpus = 0.5
+pids = 128
+timeout_secs = 3600
+pool_size = 5
+max_concurrent_execs = 2
+
+[tiers.heavy]
+image = "den-sandbox:latest"
+memory_mb = 4096
+cpus = 4.0
+pids = 512
+timeout_secs = 86400
+pool_size = 1
+max_concurrent_execs = 8
+
+[tiers.heavy.tmpfs]
+"/tmp" = "size=1G,mode=1777"
+```
+
+```bash
+# Light sandbox for quick tasks
+curl -X POST localhost:8080/api/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"tier":"light"}'
+
+# Heavy sandbox for builds
+curl -X POST localhost:8080/api/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"tier":"heavy"}'
+```
