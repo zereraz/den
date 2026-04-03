@@ -23,6 +23,7 @@ pids = 256
 timeout_secs = 86400       # max sandbox lifetime (24h)
 pool_size = 2              # warm containers ready to claim
 readonly_rootfs = false
+max_concurrent_execs = 4   # max parallel exec per sandbox (429 when exceeded)
 
 [tiers.default.tmpfs]
 "/tmp" = "size=200M,mode=1777"

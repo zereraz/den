@@ -163,6 +163,7 @@ impl Pool {
             tier_config.timeout_secs,
             metadata,
             bind_mounts,
+            tier_config.max_concurrent_execs,
         );
 
         sandbox.transition(SandboxState::Starting)?;
@@ -194,8 +195,9 @@ impl Pool {
 
         let sandbox = entry.value_mut();
 
-        if sandbox.state == SandboxState::Running {
-            sandbox.transition(SandboxState::Completed)?;
+        if sandbox.state == SandboxState::Running || sandbox.state == SandboxState::Defunct {
+            // For Defunct, container is already dead — just mark completed
+            sandbox.state = SandboxState::Completed;
         }
 
         let container_id = sandbox.container_id.clone();

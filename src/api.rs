@@ -8,7 +8,9 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::docker::DockerManager;
 use crate::error::DenError;
@@ -20,6 +22,9 @@ pub struct AppState {
     pub pool: Arc<Pool>,
     pub docker: Arc<DockerManager>,
     pub scheduler: Arc<Scheduler>,
+    /// Per-sandbox exec concurrency semaphores. Created on claim, removed on destroy.
+    /// Value is (semaphore, max_permits) so we can report the limit in 429 errors.
+    pub exec_semaphores: DashMap<String, (Arc<Semaphore>, usize)>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -171,6 +176,41 @@ fn validate_bind_mount(mount: &str) -> Result<(), DenError> {
     Ok(())
 }
 
+/// Get container_id for a running sandbox. Returns clear errors for defunct/not-found.
+fn get_running_sandbox(state: &AppState, id: &str) -> Result<String, DenError> {
+    let mut entry = state
+        .pool
+        .sandboxes
+        .get_mut(id)
+        .ok_or_else(|| DenError::SandboxNotFound { id: id.into() })?;
+    let sandbox = entry.value_mut();
+    if !sandbox.state.is_usable() {
+        if sandbox.state == crate::sandbox::SandboxState::Defunct {
+            return Err(DenError::SandboxDefunct { id: id.into() });
+        }
+        return Err(DenError::InvalidState {
+            id: id.into(),
+            current: sandbox.state,
+            operation: "exec".into(),
+        });
+    }
+    sandbox.touch();
+    Ok(sandbox.container_id.clone())
+}
+
+/// Acquire an exec permit for a sandbox. Returns 429 if limit reached.
+fn try_acquire_exec(state: &AppState, id: &str) -> Result<tokio::sync::OwnedSemaphorePermit, DenError> {
+    let (sem, limit) = state
+        .exec_semaphores
+        .get(id)
+        .map(|e| (e.value().0.clone(), e.value().1))
+        .ok_or_else(|| DenError::SandboxNotFound { id: id.into() })?;
+    sem.try_acquire_owned().map_err(|_| DenError::ExecLimitReached {
+        id: id.into(),
+        limit,
+    })
+}
+
 async fn create_sandbox(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRequest>,
@@ -179,6 +219,12 @@ async fn create_sandbox(
         validate_bind_mount(mount)?;
     }
     let sandbox = state.pool.claim(&req.tier, req.metadata, req.bind_mounts).await?;
+    // Register exec semaphore for this sandbox
+    let limit = sandbox.max_concurrent_execs;
+    state.exec_semaphores.insert(
+        sandbox.id.clone(),
+        (Arc::new(Semaphore::new(limit)), limit),
+    );
     Ok(Json(sandbox.into()))
 }
 
@@ -220,6 +266,12 @@ async fn resume_sandbox(
     Path(id): Path<String>,
 ) -> Result<Json<SandboxResponse>, DenError> {
     let sandbox = state.pool.resume(&id).await?;
+    // Re-register exec semaphore for resumed sandbox
+    let limit = sandbox.max_concurrent_execs;
+    state.exec_semaphores.insert(
+        sandbox.id.clone(),
+        (Arc::new(Semaphore::new(limit)), limit),
+    );
     Ok(Json(sandbox.into()))
 }
 
@@ -227,6 +279,7 @@ async fn destroy_sandbox(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, DenError> {
+    state.exec_semaphores.remove(&id);
     state.pool.destroy(&id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -236,22 +289,8 @@ async fn exec_rest(
     Path(id): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, DenError> {
-    let container_id = {
-        let entry = state
-            .pool
-            .sandboxes
-            .get(&id)
-            .ok_or_else(|| DenError::SandboxNotFound { id: id.clone() })?;
-        // Touch to update last_activity
-        drop(entry);
-        let mut entry = state
-            .pool
-            .sandboxes
-            .get_mut(&id)
-            .ok_or_else(|| DenError::SandboxNotFound { id: id.clone() })?;
-        entry.value_mut().touch();
-        entry.value().container_id.clone()
-    };
+    let container_id = get_running_sandbox(&state, &id)?;
+    let _permit = try_acquire_exec(&state, &id)?;
 
     const MAX_EXEC_TIMEOUT: u64 = 300;
     let timeout = req.timeout_secs.unwrap_or(30).min(MAX_EXEC_TIMEOUT);
@@ -286,18 +325,15 @@ async fn exec_ws(
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, DenError> {
-    let container_id = {
-        let entry = state
-            .pool
-            .sandboxes
-            .get(&id)
-            .ok_or_else(|| DenError::SandboxNotFound { id: id.clone() })?;
-        entry.value().container_id.clone()
-    };
+    let container_id = get_running_sandbox(&state, &id)?;
+    let permit = try_acquire_exec(&state, &id)?;
 
     Ok(ws
         .max_message_size(64 * 1024) // 64 KB max per WS message
-        .on_upgrade(move |socket| handle_ws(socket, state, id, container_id)))
+        .on_upgrade(move |socket| {
+            // permit is moved into the async block — released when WS session ends
+            handle_ws(socket, state, id, container_id, permit)
+        }))
 }
 
 /// Max WS exec session duration (1 hour).
@@ -308,6 +344,7 @@ async fn handle_ws(
     state: Arc<AppState>,
     sandbox_id: String,
     container_id: String,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::AsyncWriteExt;

@@ -11,6 +11,8 @@ pub enum SandboxState {
     Pending,
     Starting,
     Running,
+    /// Container died unexpectedly (OOM, crash). Resumable — not terminal.
+    Defunct,
     Completed,
     Failed,
     Timeout,
@@ -22,13 +24,19 @@ impl SandboxState {
         match self {
             Pending => &[Starting, Failed],
             Starting => &[Running, Failed],
-            Running => &[Completed, Failed, Timeout],
+            Running => &[Completed, Failed, Timeout, Defunct],
+            Defunct => &[], // resume resets state directly, not via transition()
             Completed | Failed | Timeout => &[],
         }
     }
 
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Timeout)
+    }
+
+    /// Returns true if the sandbox can accept exec requests.
+    pub fn is_usable(self) -> bool {
+        self == Self::Running
     }
 }
 
@@ -49,6 +57,9 @@ pub struct Sandbox {
     /// Stored so resume can recreate the container with the same mounts.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bind_mounts: Vec<String>,
+    /// Max concurrent exec requests. Set from tier config at claim time.
+    #[serde(skip)]
+    pub max_concurrent_execs: usize,
 }
 
 impl Sandbox {
@@ -60,6 +71,7 @@ impl Sandbox {
         timeout_secs: u64,
         metadata: HashMap<String, String>,
         bind_mounts: Vec<String>,
+        max_concurrent_execs: usize,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -74,6 +86,7 @@ impl Sandbox {
             timeout_secs,
             metadata,
             bind_mounts,
+            max_concurrent_execs,
         }
     }
 
@@ -127,6 +140,7 @@ mod tests {
             60,
             HashMap::new(),
             Vec::new(),
+            4,
         )
     }
 
@@ -171,6 +185,21 @@ mod tests {
         let mut s = make_sandbox();
         s.state = SandboxState::Running;
         assert!(s.transition(SandboxState::Timeout).is_ok());
+    }
+
+    #[test]
+    fn running_to_defunct() {
+        let mut s = make_sandbox();
+        s.state = SandboxState::Running;
+        assert!(s.transition(SandboxState::Defunct).is_ok());
+        assert_eq!(s.state, SandboxState::Defunct);
+        assert!(!s.state.is_terminal()); // resumable
+        assert!(!s.state.is_usable());   // not exec-able
+    }
+
+    #[test]
+    fn defunct_is_not_terminal() {
+        assert!(!SandboxState::Defunct.is_terminal());
     }
 
     #[test]

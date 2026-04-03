@@ -60,6 +60,9 @@ pub struct TierConfig {
     pub readonly_rootfs: bool,
     #[serde(default)]
     pub tmpfs: Option<HashMap<String, String>>,
+    /// Max concurrent exec requests per sandbox. 429 when exceeded. Default: 4.
+    #[serde(default = "default_max_concurrent_execs")]
+    pub max_concurrent_execs: usize,
 }
 
 fn default_host() -> String {
@@ -85,6 +88,9 @@ fn default_pids() -> i64 {
 }
 fn default_pool_size() -> usize {
     3
+}
+fn default_max_concurrent_execs() -> usize {
+    4
 }
 
 pub fn load(path: &str) -> Result<DenConfig, DenError> {

@@ -68,8 +68,8 @@ impl Reaper {
 
                 match self.docker.container_is_running(&sandbox.container_id).await {
                     Ok(false) => {
-                        tracing::warn!(sandbox = %sandbox.id, "container exited unexpectedly");
-                        to_stop.push((sandbox.id.clone(), sandbox.container_id.clone(), SandboxState::Failed));
+                        tracing::warn!(sandbox = %sandbox.id, "container exited unexpectedly, marking defunct");
+                        to_stop.push((sandbox.id.clone(), sandbox.container_id.clone(), SandboxState::Defunct));
                     }
                     Err(e) => {
                         tracing::warn!(sandbox = %sandbox.id, error = %e, "inspect failed");
@@ -93,13 +93,13 @@ impl Reaper {
             tracing::info!(sandbox = %sandbox_id, "container reaped (volume kept)");
         }
 
-        // Phase 2: full cleanup of terminal sandboxes past volume TTL
+        // Phase 2: full cleanup of terminal/defunct sandboxes past volume TTL
         let mut to_destroy = Vec::new();
 
         for entry in self.sandboxes.iter() {
             let sandbox = entry.value();
 
-            if sandbox.state.is_terminal() {
+            if sandbox.state.is_terminal() || sandbox.state == SandboxState::Defunct {
                 let age = chrono::Utc::now().signed_duration_since(sandbox.last_activity);
                 if age.num_seconds() as u64 >= volume_ttl {
                     to_destroy.push((

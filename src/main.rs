@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         docker: docker.clone(),
         scheduler,
+        exec_semaphores: dashmap::DashMap::new(),
     });
 
     let app = api::router(app_state)

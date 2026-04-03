@@ -31,6 +31,12 @@ pub enum DenError {
     #[error("tier {tier} not found")]
     TierNotFound { tier: String },
 
+    #[error("sandbox {id} is defunct (container died), resume to recover")]
+    SandboxDefunct { id: String },
+
+    #[error("sandbox {id} exec limit reached ({limit} concurrent)")]
+    ExecLimitReached { id: String, limit: usize },
+
     #[error("timeout after {seconds}s")]
     Timeout { seconds: u64 },
 
@@ -52,6 +58,12 @@ impl IntoResponse for DenError {
             DenError::TierNotFound { .. } => (StatusCode::NOT_FOUND, self.to_string()),
             DenError::PoolExhausted { .. } => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             DenError::InvalidState { .. } => (StatusCode::CONFLICT, self.to_string()),
+            DenError::SandboxDefunct { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+            }
+            DenError::ExecLimitReached { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, self.to_string())
+            }
             DenError::InsufficientResources { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
             }
